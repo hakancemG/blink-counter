@@ -99,25 +99,37 @@ def main():
                     blink_count += 1
                 ear_consecutive_frames = 0
 
-        # Sayıyı sol üstte büyük yaz
-        font_scale = 3
-        thickness = 6
-        text = str(blink_count)
-        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        # --- Overlay: kamera tam ekran, sadece yazılar üstte ---
 
-        cv2.rectangle(frame, (10, 10), (20 + text_w, 30 + text_h), (0, 0, 0), -1)
-        cv2.rectangle(frame, (10, 10), (20 + text_w, 30 + text_h), (255, 255, 255), 2)
+        # Sol üst: koyu yarı saydam kutu içinde büyük beyaz sayı + "blinks"
+        number_text = str(blink_count)
+        number_scale = 2.2
+        number_thick = 4
+        (num_w, num_h), _ = cv2.getTextSize(number_text, cv2.FONT_HERSHEY_SIMPLEX, number_scale, number_thick)
+        label_text = "blinks"
+        label_scale = 0.5
+        label_thick = 1
+        (label_w, label_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thick)
+        box_w = max(num_w, label_w) + 40
+        box_h = num_h + label_h + 36
+        x1, y1 = 24, 24
+        x2, y2 = x1 + box_w, y1 + box_h
+        roi = frame[y1:y2, x1:x2]
+        overlay = roi.copy()
+        cv2.rectangle(overlay, (0, 0), (box_w, box_h), (30, 32, 42), -1)
+        cv2.addWeighted(overlay, 0.6, roi, 0.4, 0, roi)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 75, 95), 1)
+        cv2.putText(frame, number_text, (x1 + 20, y1 + num_h + 18), cv2.FONT_HERSHEY_SIMPLEX, number_scale, (255, 255, 255), number_thick, cv2.LINE_AA)
+        cv2.putText(frame, label_text, (x1 + 20, y1 + num_h + label_h + 30), cv2.FONT_HERSHEY_SIMPLEX, label_scale, (200, 200, 210), label_thick, cv2.LINE_AA)
 
-        cv2.putText(
-            frame,
-            text,
-            (15, 15 + text_h),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            (255, 255, 255),
-            thickness,
-            cv2.LINE_AA,
-        )
+        # Sağ üst: "Blink Counter" başlığı
+        title = "Blink Counter"
+        title_scale = 0.65
+        title_thick = 2
+        (title_w, title_h), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, title_scale, title_thick)
+        title_x = w - title_w - 24
+        title_y = 24 + title_h + 8
+        cv2.putText(frame, title, (title_x, title_y), cv2.FONT_HERSHEY_SIMPLEX, title_scale, (220, 222, 235), title_thick, cv2.LINE_AA)
 
         cv2.imshow("Göz Kırpma Sayacı", frame)
 
