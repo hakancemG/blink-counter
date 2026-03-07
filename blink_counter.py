@@ -6,7 +6,9 @@ OpenCV + MediaPipe FaceLandmarker ile gerçek zamanlı göz kırpma tespiti
 import cv2
 import math
 import os
+import time
 import urllib.request
+import winsound
 
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -64,6 +66,9 @@ def main():
     cap = cv2.VideoCapture(0)
 
     blink_count = 0
+    blink_timestamps = []  # Son 60 sn için kırpma zamanları
+    last_alarm_time = 0
+    start_time = time.time()
     ear_threshold = 0.22
     ear_consecutive_frames = 0
     frames_to_blink = 2
@@ -97,7 +102,17 @@ def main():
             else:
                 if ear_consecutive_frames >= frames_to_blink:
                     blink_count += 1
+                    blink_timestamps.append(time.time())
                 ear_consecutive_frames = 0
+
+        # Göz sağlığı alarmı: son 60 sn'de 7'den az kırpma varsa ses çal
+        now = time.time()
+        if now - start_time >= 60 and now - last_alarm_time >= 60:
+            recent_blinks = [t for t in blink_timestamps if now - t <= 60]
+            if len(recent_blinks) < 7:
+                winsound.Beep(1000, 1000)
+                last_alarm_time = now
+                blink_timestamps.clear()
 
         # --- Overlay: kamera tam ekran, sadece yazılar üstte ---
 
