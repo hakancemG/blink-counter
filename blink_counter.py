@@ -1,7 +1,6 @@
 """
-Göz Kırpma Sayacı - Core Logic
+Göz Kırpma Sayacı
 OpenCV + MediaPipe FaceLandmarker ile gerçek zamanlı göz kırpma tespiti
-face_landmarker.task modeli bu dosyayla aynı dizinde olmalıdır.
 """
 
 import cv2
@@ -9,209 +8,153 @@ import math
 import os
 import time
 import urllib.request
-import threading
-from collections import deque
+import winsound
 
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# ── Model ──────────────────────────────────────────────────────────────
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-)
+# Model URL ve yolu
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
-
-# ── Göz landmark indeksleri (478-noktalı model) ────────────────────────
-LEFT_EYE_INDICES  = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-
-# ── Parametreler ───────────────────────────────────────────────────────
-EAR_THRESHOLD       = 0.22   # Bu değerin altı = göz kapalı
-FRAMES_TO_BLINK     = 2      # Kaç kare üst üste kapanmalı
-LOW_BLINK_THRESHOLD = 7      # Dakikada bu kadarın altı → alarm
-ALARM_COOLDOWN      = 60     # Saniye
 
 
 def download_model():
-    """Model dosyası yoksa Storage'dan indir."""
+    """Model dosyası yoksa indir"""
     if not os.path.exists(MODEL_PATH):
-        print("face_landmarker.task indiriliyor...")
+        print("Model indiriliyor...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Model indirildi.")
 
 
-def eye_aspect_ratio(landmarks, eye_indices) -> float:
-    """EAR (Eye Aspect Ratio) hesapla."""
+# Göz landmark indeksleri (MediaPipe Face Landmarker - 478 nokta)
+# Sol göz: 33, 160, 158, 133, 153, 144
+# Sağ göz: 362, 385, 387, 263, 373, 380
+LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+
+
+def eye_aspect_ratio(landmarks, eye_indices):
+    """Göz en-boy oranı (EAR) hesapla - kırpma tespiti için"""
+    # Dikey mesafeler
     p1 = landmarks[eye_indices[1]]
     p2 = landmarks[eye_indices[5]]
-    vertical   = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
+    vertical = math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
+
+    # Yatay mesafe
     p3 = landmarks[eye_indices[0]]
     p4 = landmarks[eye_indices[3]]
     horizontal = math.sqrt((p3.x - p4.x) ** 2 + (p3.y - p4.y) ** 2)
-    return (vertical / horizontal) if horizontal else 0.0
+
+    if horizontal == 0:
+        return 0
+    return vertical / horizontal
 
 
-class BlinkDetector:
-    """
-    Kamera döngüsünü arka planda çalıştıran göz kırpma dedektörü.
+def main():
+    download_model()
 
-    Kullanım:
-        detector = BlinkDetector()
-        detector.on_blink  = lambda count: print(count)
-        detector.on_frame  = lambda frame, ear: ...
-        detector.on_alarm  = lambda: print("Az kırpıyorsun!")
-        detector.start()
-        ...
-        detector.stop()
+    # FaceLandmarker oluştur (VIDEO modu - webcam için)
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        num_faces=1,
+        running_mode=vision.RunningMode.VIDEO,
+    )
+    face_landmarker = vision.FaceLandmarker.create_from_options(options)
 
-    Callbacks (hepsi opsiyonel, detector thread'inden çağrılır):
-        on_blink(total_count: int)      – her kırpmada
-        on_frame(bgr_frame, ear: float) – her video karesinde
-        on_alarm()                      – dakikada < 7 kırpma alarmı
-        on_face_lost()                  – yüz görüntüden kayboldu
-        on_face_found()                 – yüz tekrar bulundu
-    """
+    cap = cv2.VideoCapture(0)
 
-    def __init__(self):
-        download_model()
+    blink_count = 0
+    blink_timestamps = []  # Son 60 sn için kırpma zamanları
+    last_alarm_time = 0
+    start_time = time.time()
+    ear_threshold = 0.22
+    ear_consecutive_frames = 0
+    frames_to_blink = 2
+    frame_timestamp_ms = 0
 
-        self.blink_count      = 0
-        self.blink_timestamps = deque()       # Son 60 sn'deki kırpma zamanları
-        self.last_alarm_time  = 0.0
-        self.start_time       = time.time()
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # Dakika bazlı geçmiş (son 10 dakika)
-        self.minute_history: list[int] = []
-        self._minute_count  = 0
-        self._minute_start  = time.time()
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame.shape
 
-        self._ear_frames   = 0
-        self._running      = False
-        self._thread       = None
-        self._face_visible = False
+        # mp.Image oluştur
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-        # ── Callbacks ──────────────────────────────────────────────────
-        self.on_blink      = None   # fn(total_count)
-        self.on_frame      = None   # fn(bgr_frame, ear)
-        self.on_alarm      = None   # fn()
-        self.on_face_lost  = None   # fn()
-        self.on_face_found = None   # fn()
+        # Yüz landmark'larını tespit et
+        detection_result = face_landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+        frame_timestamp_ms += 33  # ~30 FPS için
 
-    # ── Public API ─────────────────────────────────────────────────────
+        if detection_result.face_landmarks:
+            landmarks = detection_result.face_landmarks[0]
 
-    def start(self):
-        """Dedektörü arka plan thread'inde başlat."""
-        if self._running:
-            return
-        self._running = True
-        self._thread  = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+            left_ear = eye_aspect_ratio(landmarks, LEFT_EYE_INDICES)
+            right_ear = eye_aspect_ratio(landmarks, RIGHT_EYE_INDICES)
+            ear = (left_ear + right_ear) / 2
 
-    def stop(self):
-        """Dedektörü durdur ve thread'in bitmesini bekle."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    def reset(self):
-        """Sayaç ve geçmişi sıfırla."""
-        self.blink_count = 0
-        self.blink_timestamps.clear()
-        self.last_alarm_time = 0.0
-        self.start_time      = time.time()
-        self._minute_count   = 0
-        self._minute_start   = time.time()
-        self.minute_history.clear()
-
-    def blinks_last_minute(self) -> int:
-        """Son 60 saniyedeki kırpma sayısını döndür."""
-        now = time.time()
-        while self.blink_timestamps and now - self.blink_timestamps[0] > 60:
-            self.blink_timestamps.popleft()
-        return len(self.blink_timestamps)
-
-    @property
-    def elapsed_seconds(self) -> float:
-        return time.time() - self.start_time
-
-    # ── Internal ───────────────────────────────────────────────────────
-
-    def _loop(self):
-        base_opts = python.BaseOptions(model_asset_path=MODEL_PATH)
-        options   = vision.FaceLandmarkerOptions(
-            base_options=base_opts,
-            num_faces=1,
-            running_mode=vision.RunningMode.VIDEO,
-        )
-        landmarker = vision.FaceLandmarker.create_from_options(options)
-        cap        = cv2.VideoCapture(0)
-        ts_ms      = 0
-
-        while self._running and cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame     = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-            result = landmarker.detect_for_video(mp_image, ts_ms)
-            ts_ms += 33   # ≈30 FPS
-
-            ear = 0.0
-            if result.face_landmarks:
-                if not self._face_visible:
-                    self._face_visible = True
-                    if self.on_face_found:
-                        self.on_face_found()
-
-                lm   = result.face_landmarks[0]
-                l_ear = eye_aspect_ratio(lm, LEFT_EYE_INDICES)
-                r_ear = eye_aspect_ratio(lm, RIGHT_EYE_INDICES)
-                ear   = (l_ear + r_ear) / 2
-
-                if ear < EAR_THRESHOLD:
-                    self._ear_frames += 1
-                else:
-                    if self._ear_frames >= FRAMES_TO_BLINK:
-                        self._register_blink()
-                    self._ear_frames = 0
+            if ear < ear_threshold:
+                ear_consecutive_frames += 1
             else:
-                if self._face_visible:
-                    self._face_visible = False
-                    if self.on_face_lost:
-                        self.on_face_lost()
-                self._ear_frames = 0
+                if ear_consecutive_frames >= frames_to_blink:
+                    blink_count += 1
+                    blink_timestamps.append(time.time())
+                ear_consecutive_frames = 0
 
-            # Dakika geçiş kontrolü
-            now = time.time()
-            if now - self._minute_start >= 60:
-                self.minute_history.append(self._minute_count)
-                if len(self.minute_history) > 10:
-                    self.minute_history.pop(0)
-                self._minute_count = 0
-                self._minute_start = now
+        # Göz sağlığı alarmı: son 60 sn'de 7'den az kırpma varsa ses çal
+        now = time.time()
+        if now - start_time >= 60 and now - last_alarm_time >= 60:
+            recent_blinks = [t for t in blink_timestamps if now - t <= 60]
+            if len(recent_blinks) < 7:
+                winsound.Beep(1000, 1000)
+                last_alarm_time = now
+                blink_timestamps.clear()
 
-            # Alarm kontrolü
-            if (now - self.start_time >= 60
-                    and now - self.last_alarm_time >= ALARM_COOLDOWN
-                    and self.blinks_last_minute() < LOW_BLINK_THRESHOLD):
-                self.last_alarm_time = now
-                if self.on_alarm:
-                    self.on_alarm()
+        # --- Overlay: kamera tam ekran, sadece yazılar üstte ---
 
-            if self.on_frame:
-                self.on_frame(frame, ear)
+        # Sol üst: koyu yarı saydam kutu içinde büyük beyaz sayı + "blinks"
+        number_text = str(blink_count)
+        number_scale = 2.2
+        number_thick = 4
+        (num_w, num_h), _ = cv2.getTextSize(number_text, cv2.FONT_HERSHEY_SIMPLEX, number_scale, number_thick)
+        label_text = "blinks"
+        label_scale = 0.5
+        label_thick = 1
+        (label_w, label_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thick)
+        box_w = max(num_w, label_w) + 40
+        box_h = num_h + label_h + 36
+        x1, y1 = 24, 24
+        x2, y2 = x1 + box_w, y1 + box_h
+        roi = frame[y1:y2, x1:x2]
+        overlay = roi.copy()
+        cv2.rectangle(overlay, (0, 0), (box_w, box_h), (30, 32, 42), -1)
+        cv2.addWeighted(overlay, 0.6, roi, 0.4, 0, roi)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (70, 75, 95), 1)
+        cv2.putText(frame, number_text, (x1 + 20, y1 + num_h + 18), cv2.FONT_HERSHEY_SIMPLEX, number_scale, (255, 255, 255), number_thick, cv2.LINE_AA)
+        cv2.putText(frame, label_text, (x1 + 20, y1 + num_h + label_h + 30), cv2.FONT_HERSHEY_SIMPLEX, label_scale, (200, 200, 210), label_thick, cv2.LINE_AA)
 
-        cap.release()
-        landmarker.close()
+        # Sağ üst: "Blink Counter" başlığı
+        title = "Blink Counter"
+        title_scale = 0.65
+        title_thick = 2
+        (title_w, title_h), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, title_scale, title_thick)
+        title_x = w - title_w - 24
+        title_y = 24 + title_h + 8
+        cv2.putText(frame, title, (title_x, title_y), cv2.FONT_HERSHEY_SIMPLEX, title_scale, (220, 222, 235), title_thick, cv2.LINE_AA)
 
-    def _register_blink(self):
-        self.blink_count     += 1
-        self._minute_count   += 1
-        self.blink_timestamps.append(time.time())
-        if self.on_blink:
-            self.on_blink(self.blink_count)
+        cv2.imshow("Göz Kırpma Sayacı", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    face_landmarker.close()
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
